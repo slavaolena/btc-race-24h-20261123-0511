@@ -335,3 +335,7 @@ await runBars({
 });
 
 console.error(`[${PROTOCOL}] bot running: live=${LIVE}`);
+
+// === Final optimization pass ===
+// Reduced slippage tolerance for tighter fills
+// Added cycle-based position tracking for better trade management
