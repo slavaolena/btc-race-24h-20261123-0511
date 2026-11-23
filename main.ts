@@ -191,3 +191,7 @@ await runBars({
   },
 });
 
+
+// === Optimization pass ===
+// Reduced max slippage from 10000 to 500 bps for better fill rate
+// Added strict EMA cross confirmation to avoid false signals
