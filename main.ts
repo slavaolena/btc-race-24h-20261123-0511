@@ -1,20 +1,50 @@
 /**
- * btc-race-24h trading bot (from scratch)
+ * btc-race-24h trading bot
  *
- * Operates on the *24h* race window: the bot only trades when the running wall-clock window has
- * rolled over, and it carries a fresh daily state per symbol (entry, targets, trailing logic) that
- * resets on the 24h boundary. When running in replay via `vendor/makefun-bars.ts`, the same policy
- * is applied once per bar so a scored run can be backtested deterministically; the wall-clock 24h
- * gating is present for live use via `runLive()`.
+ * PURPOSE
+ *   Daily (24h) race bot for BTCUSDT. It maintains one fresh "cycle" per symbol that resets on the
+ *   24h boundary (live mode) or is evaluated deterministically once per bar (replay / backtest mode).
+ *   Within a cycle the bot can enter once, scale out at two profit targets, trail the remainder, and
+ *   hard-stop if the 24h loss limit is breached.
+ *
+ * MODE
+ *   - Replay (default): driven by `runBars` from `vendor/makefun-bars.ts`. No wall-clock gating;
+ *     the same policy is applied every batch so runs are deterministic and backtestable.
+ *   - Live (`--live`): wall-clock 24h gating is enabled. Per-symbol cycle state is cleared on the
+ *     24h boundary and when batch snapshots get stale.
+ *
+ * ENTRY LOGIC
+ *   Long-only momentum filter on the latest bar:
+ *     - close > open (green bar in quote terms)
+ *     - intraday change <= 800 bps (avoid chasing explosive late bars)
+ *   Size is capped by weight room, the hello caps, and a per-entry notional ceiling. Sizing is
+ *   converted from quote notional to native qty using symbol price/qty scales.
+ *
+ * EXIT LOGIC (within a cycle)
+ *   - Hard stop at HARD_STOP_BPS from entry close (full flat)
+ *   - Partial at TP1_BPS (half of position; trails restart from there)
+ *   - Full exit at TP2_BPS if anything remains
+ *   - Trailing stop once the position is in profit enough; exits the remainder if price drops back
+ *     to the trailing stop close
+ *
+ * RISK / POSITION LIMITS
+ *   - Per-symbol max weight per 24h cycle: MAX_WEIGHT_BPS_PER_SYMBOL
+ *   - Per-entry notional ceiling: MAX_ENTRY_NOTIONAL_QUOTE_UNITS
+ *   - Slippage + impact budget: MAX_SLIPPAGE_BPS
+ *   - Min notional guard pulled from hello fees
+ *
+ * CONFIG TRACEABILITY
+ *   Profit targets, stop, and trail parameters are expressed in bps from the symbol's 24h entry
+ *   close so the same policy is easy to reason about across live and replay paths.
  */
 
 import { runBars, type BarsState, type Batch } from './vendor/makefun-bars.ts';
 
-// ---------------------------------------------------------------------------- protocol constants
+// --------------------------------------------------------------------------- protocol constants
 
 const PROTOCOL = 'btc-race-24h';
 
-// ---------------------------------------------------------------------------- strategy config (24h race)
+// --------------------------------------------------------------------------- strategy config (24h race)
 
 /** Symbols watched in this race. The harness provides the real universe in hello; these are only
  * defaults used by the live path before hello arrives. */
@@ -26,33 +56,33 @@ const LIVE_SNAP_MAX_AGE_MS = 5 * 60_000; // 5 min
 // Live 24h window control
 const RACE_WINDOW_MS = 24 * 60 * 60_000; // 24h
 
-// ---------------------------------------------------------------------------- position / risk params (24h horizon)
+// --------------------------------------------------------------------------- position / risk params (24h horizon)
 
 /** Max quote units any single symbol may spend per 24h cycle at the moment of entry, as a fraction
  * of current equity. Kept conservative for a race-length horizon. */
 const MAX_WEIGHT_BPS_PER_SYMBOL = 2_000; // 20%
 
-/**Max notional per entry (quote units). Prevents one oversized fill from eating the entire budget. */
+/** Max notional per entry (quote units). Prevents one oversized fill from eating the entire budget. */
 const MAX_ENTRY_NOTIONAL_QUOTE_UNITS = 1_000_000n; // 1M USDC-equivalent cap
 
-/**Slippage bundle: slippage + impact budgeting. Tight for race execution. */
+/** Slippage + impact budget. Tight enough for race execution while leaving room for liquidity. */
 const MAX_SLIPPAGE_BPS = 250; // 2.5%
 
-/**Profit targets measured as bps from a symbol's 24h entry close. Multiple targets allow partial
+/** Profit targets measured as bps from a symbol's 24h entry close. Multiple targets allow partial
  * scaling within a single daily cycle. */
 const TP1_BPS = 150; // 1.5%
 const TP2_BPS = 400; // 4.0%
 
-/**Loss limit for the 24h cycle. Hard exit on breach (protects the race). */
+/** Loss limit for the 24h cycle. Hard exit on breach (protects the race). */
 const HARD_STOP_BPS = -450; // -4.5%
 
-/**Trail activates once a position is in profit by this many bps; trails by this many bps. */
+/** Trail activates once a position is in profit by this many bps; trails by this many bps. */
 const TRAIL_ACTIVATION_BPS = 150;
 const TRAIL_OFFSET_BPS = 150;
 
-// ---------------------------------------------------------------------------- types for the in-memory 24h state
+// --------------------------------------------------------------------------- types for the in-memory 24h state
 
-/**Per-symbol 24h cycle state kept by the bot. Reset when the race window rolls over. */
+/** Per-symbol 24h cycle state kept by the bot. Reset when the race window rolls over. */
 interface CycleState {
   /** Has this symbol been entered this 24h cycle? */
   entered: boolean;
@@ -70,16 +100,16 @@ interface CycleState {
   tp1Taken: boolean;
 }
 
-// ---------------------------------------------------------------------------- live vs replay
+// --------------------------------------------------------------------------- live vs replay
 
-/**Whether the bot is running in live mode. In replay mode (runBars), this stays false and the
+/** Whether the bot is running in live mode. In replay mode (runBars), this stays false and the
  * 24h gating is evaluated once per bar (deterministic backtestable behavior). Live mode is off by
  * default and can be enabled with `--live` cli arg. */
 const LIVE = Deno?.args.includes('--live') ?? false;
 
-// ---------------------------------------------------------------------------- helpers
+// --------------------------------------------------------------------------- helpers
 
-/**Returns true when the current wall-clock instant is past the next 24h boundary given the provided
+/** Returns true when the current wall-clock instant is past the next 24h boundary given the provided
  * epoch origin. Used by the live path to enforce a clean reset of per-symbol state. */
 function past24hBoundarySince(epochMs: number, nowMs: number): boolean {
   const elapsed = nowMs - epochMs;
@@ -89,20 +119,24 @@ function past24hBoundarySince(epochMs: number, nowMs: number): boolean {
     : false;
 }
 
-/**Straight-line 24h return in bps from entryClose to currentClose. */
+/** Straight-line 24h return in bps from entryClose to currentClose. */
 function returnBps(entryClose: bigint, currentClose: bigint): bigint {
   if (entryClose === 0n || entryClose <= 0n) return 0n;
   return ((currentClose - entryClose) * 10_000n) / entryClose;
 }
 
-/**Build a new client_id that hasn't been used in this run. The harness shim also auto-assigns one
+/** Base precision constant used by the harness for weight / budget math. Defined locally so the
+ * strategy file is self-contained and the weight math is easy to trace. */
+const BPS = 10_000n;
+
+/** Build a new client_id that hasn't been used in this run. The harness shim also auto-assigns one
  * if omitted, but assigning ours keeps logs stable across the two-run byte-match requirement. */
 function nextClientId(state: BarsState): string {
   // Use the harness-provided sequence so ids are stable and unique per batch.
   return `c${state.seq + 1}n`;
 }
 
-// ---------------------------------------------------------------------------- strategy (replay / backtest path)
+// --------------------------------------------------------------------------- strategy (replay / backtest path)
 
 export async function runBarsStrategy(state: BarsState) {
   // In replay, forget the live 24h wall-clock gating; act on every batch deterministically.
@@ -283,7 +317,7 @@ export async function runBarsStrategy(state: BarsState) {
   return [];
 }
 
-// ---------------------------------------------------------------------------- main entry point
+// --------------------------------------------------------------------------- main entry point
 
 await runBars({
   onHello(state) {
@@ -335,7 +369,3 @@ await runBars({
 });
 
 console.error(`[${PROTOCOL}] bot running: live=${LIVE}`);
-
-// === Final optimization pass ===
-// Reduced slippage tolerance for tighter fills
-// Added cycle-based position tracking for better trade management
